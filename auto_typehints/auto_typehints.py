@@ -233,6 +233,11 @@ class ClassInfo:
                     hint_parts.append('bool')
                 elif h == 'array' or h == 'np.array':
                     hint_parts.append('np.ndarray')
+                elif h == 'Circuit':
+                    hint_parts.append('QuantumCircuit')
+                elif h == 'matrix_like':
+                    # just ignore
+                    pass
                 else:
                     parts = h.split('.')
                     if len(parts) > 1:
@@ -269,6 +274,31 @@ class ClassInfo:
                     hint_parts.append(h)
             return ' | '.join(hint_parts)
 
+        @dataclass
+        class DummyDetail:
+            name: str
+            annotation = inspect.Parameter.empty
+            default = inspect.Parameter.empty
+
+            def __str__(self) -> str:
+                return self.name
+
+        def supplement_signature_parameters(signature) -> dict:
+            """signature may have '*', so take care of such cases, e.g., z2_symmetries.py"""
+
+            signature_parameters = OrderedDict()
+
+            signature_str = str(signature)
+            signature_str = re.split(r'\s*->\s*', signature_str)[0]
+            signature_str = signature_str.replace('(', '').replace(')', '')
+            signature_list = re.split(r'\s*,\s*', signature_str)
+            signature_list = [re.split(r'\s*=\s*', parameter)[0] for parameter in signature_list]
+            signature_list = [re.split(r'\s*:\s*', parameter)[0] for parameter in signature_list]
+            for key in signature_list:
+                signature_parameters[key] = signature.parameters[key] if key in signature.parameters else DummyDetail(key)
+
+            return signature_parameters
+
         name2hint = OrderedDict()  # key: qualified_name
         name2default = OrderedDict()  # key: qualified_name
 
@@ -277,7 +307,9 @@ class ClassInfo:
             name2hint['cls'] = None
             name2default['cls'] = inspect.Parameter.empty
 
-        for name, detail in signature.parameters.items():
+        signature_parameters = supplement_signature_parameters(signature)
+
+        for name, detail in signature_parameters.items():
             # e.g., '**kwargs'
             qualified_name = re.split(r'\s*:\s*', re.split(r'\s*=\s*', str(detail))[0])[0]
 
@@ -519,7 +551,8 @@ class SignatureReplacer:
             new_method_decl = None
 
             lines = [line.rstrip() for line in fin.readlines()]
-            last_import_line_no_line_no = self._calc_last_import_line_no(lines)
+            first_import_line_no = self._calc_first_import_line_no(lines)
+            last_import_line_no = self._calc_last_import_line_no(lines)
 
             for line_no, line in enumerate(lines):
                 # end of class definition
@@ -527,7 +560,7 @@ class SignatureReplacer:
                     class_name = None
 
                 # end of method signature
-                if method_name is not None and ':' in line:
+                if method_name is not None and line.endswith(':'):
                     if new_method_decl is not None:
                         print(new_method_decl, file=fout)
                         new_method_decl = None
@@ -541,12 +574,17 @@ class SignatureReplacer:
                     continue
 
                 if class_name is None:
+                    if line_no == first_import_line_no:
+                        if '__future__' not in line:
+                            print('from __future__ import annotations  # added by auto_typehints', file=fout)
+
                     print(line, file=fout)
 
-                    if line_no == last_import_line_no_line_no:
+                    # may be last == first, so not use elif...
+                    if line_no == last_import_line_no:
                         # dump missing import
                         for from_, modules in self.signature_improver.missing_symbols.items():
-                            print(f"from {from_} import {', '.join(modules)}", file=fout)
+                            print(f"from {from_} import {', '.join(modules)}  # added by auto_typehints", file=fout)
                 else:
                     # start of method signature
                     if m := re.search(r'^\s+def\s+(\S+)\s*\(', line):
@@ -559,7 +597,7 @@ class SignatureReplacer:
                             # not improvements, just output
                             print(line, file=fout)
 
-                        if ':' in line:
+                        if line.endswith(':'):
                             if new_method_decl is not None:
                                 print(new_method_decl, file=fout)
                                 new_method_decl = None
@@ -576,12 +614,22 @@ class SignatureReplacer:
 
             shutil.move(out_file_path, self.file_path)
 
+    def _calc_first_import_line_no(self, lines: List[str]) -> int | None:
+        for line_no in range(len(lines)):
+            line = lines[line_no]
+            if re.search(r'^import', line):
+                return line_no
+            elif re.search(r'^from', line):
+                return line_no
+
+        return None
+
     def _calc_last_import_line_no(self, lines: List[str]) -> int | None:
         for line_no in range(len(lines) - 1, -1, -1):
             line = lines[line_no]
-            if m := re.search(r'^import', line):
+            if re.search(r'^import', line):
                 return line_no
-            elif m := re.search(r'^from', line):
+            elif re.search(r'^from', line):
                 if '(' not in line:
                     return line_no
                 for lno in range(line_no, len(lines) - 1):
@@ -593,29 +641,48 @@ class SignatureReplacer:
         return None
 
 
+def retrieve_directory_path(module_name: str, qiskit_root: str) -> str:
+    for file_path in glob.glob(os.path.join(qiskit_root, '**/'), recursive=True):
+        if os.path.isdir(file_path):
+            if file_path[-1] == os.sep:
+                file_path = file_path[:-1]
+            if file_path.split(os.sep)[-1] == module_name:
+                return file_path
+
+    return None
+
+
+def path_contains_any(path: str, candidates: List[str]) -> bool:
+    for candidate in candidates:
+        if candidate in path:
+            return True
+    return False
+
+
 def autohints(
     module_name: str,
     qiskit_root: str,
     suffix: str | None = None,
     inplace: bool = False,
     only_filename: List[str] | None = None,
+    only_dirname: List[str] | None = None,
     detect_missing_symbols: bool = False,
     verbose: bool = False,
 ):
     if os.path.isfile(MISSING_SYMBOLS_FILE):
         os.remove(MISSING_SYMBOLS_FILE)
 
-    module_root = None
-    for file_path in glob.glob(os.path.join(qiskit_root, '**/'), recursive=True):
-        if os.path.isdir(file_path):
-            if file_path[-1] == os.sep:
-                file_path = file_path[:-1]
-            if file_path.split(os.sep)[-1] == module_name:
-                module_root = file_path
-                break
+    module_root = retrieve_directory_path(module_name, qiskit_root)
 
     if module_root is None:
         raise ModuleNotFoundError(f"'{module_name}' is not found")
+
+    retrieved_only_dirname = []
+    for dname in only_dirname:
+        path = retrieve_directory_path(dname, qiskit_root)
+        if path is None:
+            raise ModuleNotFoundError(f"'{dname}' is not found")
+        retrieved_only_dirname.append(path)
 
     sys.path.append(qiskit_root)
     sys.path.append(module_root)
@@ -628,6 +695,8 @@ def autohints(
         if suffix is not None and file_path.endswith(f'{suffix}.py'):
             continue
         if only_filename and os.path.basename(file_path) not in only_filename:
+            continue
+        if retrieved_only_dirname and not path_contains_any(os.path.dirname(file_path), retrieved_only_dirname):
             continue
 
         # try:
@@ -666,7 +735,9 @@ def parse_opt():
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--suffix', dest='suffix', type=str, default=None, help='suffix of file')
     group.add_argument('--inplace', action='store_true', help='in-place replacement?')
-    parser.add_argument('--only', dest='only_filename', nargs='*', type=str, default=[], help='file name')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--only', dest='only_filename', nargs='*', type=str, default=[], help='file name')
+    group.add_argument('--only-dir', dest='only_dirname', nargs='*', type=str, default=[], help='directory name')
     parser.add_argument('--detect-missing-symbols', dest='detect_missing_symbols', action='store_true', help='detect missing symbols?')
     parser.add_argument('--verbose', action='store_true', help='output logs?')
     parser.add_argument('module_name', type=str, help="module_name such as 'quantum_info'")
@@ -678,7 +749,16 @@ def parse_opt():
 
 def main():
     args = parse_opt()
-    autohints(args.module_name, args.qiskit_root, args.suffix, args.inplace, args.only_filename, args.detect_missing_symbols, args.verbose)
+    autohints(
+        args.module_name,
+        args.qiskit_root,
+        args.suffix,
+        args.inplace,
+        args.only_filename,
+        args.only_dirname,
+        args.detect_missing_symbols,
+        args.verbose,
+    )
 
 
 if __name__ == '__main__':
