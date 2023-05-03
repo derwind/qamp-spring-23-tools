@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 import docstring_parser
 from collections import OrderedDict
-from typing import List, Dict, Tuple, TypedDict
+from typing import List, Set, Dict, Tuple, TypedDict
 
 
 if sys.version_info.major < 3 or sys.version_info.minor < 10:
     info = sys.version_info
     raise NotImplementedError(f'Python {info.major}.{info.minor}.{info.micro} is not supported')
+
+MISSING_SYMBOLS_FILE = 'missing_candidates.txt'
 
 
 class ModuleInfo(TypedDict):
@@ -110,6 +112,7 @@ class ClassInfo:
         self.detect_missing_symbols = detect_missing_symbols
         self.verbose = verbose
         self._methods2signatures = {}
+        self._missing_symbols = {}
         full_class_name = self.extract_class_name(str(class_type))
         if self.isclass_in_file(full_class_name, module_name):
             # sig = inspect.signature(class_type)
@@ -129,8 +132,12 @@ class ClassInfo:
                         self._methods2signatures[method_name] = signature
 
     @property
-    def methods2signatures(self):
+    def methods2signatures(self) -> Dict[str, str]:
         return self._methods2signatures
+
+    @property
+    def missing_symbols(self) -> Dict[str, List[str]]:
+        return self._missing_symbols
 
     def _method_proc(self, short_class_name: str, short_method_name: str, insp_method, is_classmethod: bool) -> Tuple[str, str] | Tuple[None, None]:
         if inspect.isfunction(insp_method):
@@ -163,7 +170,31 @@ class ClassInfo:
             print('[DOCSTRING]', arg_types, '->', returns_types.args[-1] if valid_returns_types else '')
 
         if self.detect_missing_symbols:
-            self._detect_missing_symbols(list(arg_types.values()), returns_types.args[-1] if valid_returns_types else None)
+            missing_candidates = self._detect_missing_symbols(list(arg_types.values()), returns_types.args[-1] if valid_returns_types else None)
+            if missing_candidates:
+                log_file_path = MISSING_SYMBOLS_FILE
+                mode = 'a' if os.path.isfile(log_file_path) else 'w'
+                with open(log_file_path, mode) as fout:
+                    print(f'[[{short_class_name}]]', file=fout)
+                    print(f'[{short_method_name}]', file=fout)
+                    for symbol in missing_candidates:
+                        definition = self.global_class2modules[symbol]['definition']
+                        second_candidate = ''
+                        shorter_modules = set()
+                        for candidates in self.global_class2modules[symbol]['module_names']:
+                            if candidates in definition and len(candidates) < len(definition):
+                                shorter_modules.add(candidates)
+                            if shorter_modules:
+                                second_candidate = sorted(shorter_modules)[0]
+                        print('*', symbol, ':', definition, f'({second_candidate})', file=fout)
+
+                        #from_module = second_candidate if second_candidate else definition
+
+                        # memory info for later use
+                        self._missing_symbols.setdefault(definition, [])
+                        self._missing_symbols[definition].append(symbol)
+
+                    print(f'-' * 50, file=fout)
 
         new_signature = self._supplement_signature(signature, arg_types, returns_types, short_class_name, is_classmethod)
         if self.verbose:
@@ -180,6 +211,13 @@ class ClassInfo:
         short_class_name: str,
         is_classmethod: bool,
     ) -> str:
+        """supplement signature
+        Args:
+            signature (inspect.Signature): signature from original typehints
+            doc_arg_types (OrderedDict[str, str]): signature from docstrings
+            doc_returns_types (str | inspect._empty): return value signature from docstrings
+        """
+
         def fix_hint(hint, class_name: str = short_class_name, visitor: ImportVisitor = self.visitor):
             if hint is None:
                 return None
@@ -187,9 +225,14 @@ class ClassInfo:
             hint_parts = []
             for h in re.split(r'\s*\|\s*', hint):
                 if h == class_name:
-                    hint_parts.append(f"'{h}'")
+                    # e.g. Statevector -> "Statevector"
+                    hint_parts.append(f'"{h}"')
                 elif h == 'string':
                     hint_parts.append('str')
+                elif h == 'boolean':
+                    hint_parts.append('bool')
+                elif h == 'array' or h == 'np.array':
+                    hint_parts.append('np.ndarray')
                 else:
                     parts = h.split('.')
                     if len(parts) > 1:
@@ -198,6 +241,8 @@ class ClassInfo:
                         module = module.replace('~', '')
                         # override h if needed
                         if module in visitor.modules:
+                            # e.g. numpy complex128
+                            # e.g. rustworkx PyGraph
                             module = visitor.modules[module]
                             h = '.'.join([module, name])
                         elif module.find('qiskit.') < 0 and 'qiskit.' + module in visitor.modules:
@@ -243,7 +288,10 @@ class ClassInfo:
                     hint = doc_arg_types[name]
                 name2hint[qualified_name] = fix_hint(hint)
             else:
-                name2hint[qualified_name] = fix_hint(str(detail.annotation))
+                annotation = detail.annotation
+                if hasattr(annotation, '__qualname__'):
+                    annotation = annotation.__qualname__
+                name2hint[qualified_name] = fix_hint(str(annotation))
             # no default value
             if detail.default == inspect.Parameter.empty:
                 name2default[qualified_name] = inspect.Parameter.empty
@@ -252,7 +300,10 @@ class ClassInfo:
                 if detail.default is None and name2hint[qualified_name] is not None:
                     if 'Optional' not in name2hint[qualified_name] and 'None' not in name2hint[qualified_name]:
                         name2hint[qualified_name] += ' | None'
-                name2default[qualified_name] = detail.default
+                default_value = detail.default
+                if isinstance(detail.default, str):
+                    default_value = f'"{default_value}"'
+                name2default[qualified_name] = default_value
 
         new_signature_elems = []
         # arguments of methods
@@ -286,7 +337,7 @@ class ClassInfo:
 
         return new_signature
 
-    def _detect_missing_symbols(self, arg_types: List[str], returns_types: str | None = None):
+    def _detect_missing_symbols(self, arg_types: List[str], returns_types: str | None = None) -> Set[str]:
         """detect symbols which are globally known but are not locally known"""
 
         types = set()
@@ -307,7 +358,8 @@ class ClassInfo:
                 print('[missing candidates]')
                 for symbol in missing_candidates:
                     print('*', symbol, ':', self.global_class2modules[symbol]['definition'])
-                raise Exception('some missing_candidates found')
+
+        return missing_candidates
 
     @staticmethod
     def extract_class_name(class_xxx: str):
@@ -331,7 +383,7 @@ class ClassInfo:
         for k, v in arg_types.items():
             if v is None and '\n' in k:
                 # broken
-                k = re.sub(r'\s*'+'\n'+r'\s*', ' ', k)
+                k = re.sub(r'\s*' + '\n' + r'\s*', ' ', k)
                 if m := re.match(r'(\S+)\s*\((.*)\)', k):
                     k = m.group(1)
                     v = m.group(2)
@@ -363,7 +415,14 @@ class ClassInfo:
 class SignatureImprover:
     """Construct a new signature for the method"""
 
-    def __init__(self, file_path: str, visitor: ImportVisitor, class2modules: Dict[str, ModuleInfo], detect_missing_symbols: bool = False, verbose: bool = False):
+    def __init__(
+        self,
+        file_path: str,
+        visitor: ImportVisitor,
+        class2modules: Dict[str, ModuleInfo],
+        detect_missing_symbols: bool = False,
+        verbose: bool = False,
+    ):
         file_path, _ = os.path.splitext(file_path)  # e.g. path/to/qiskit/quantum_info/states/statevector
         path_elems = file_path.split(os.sep)  # e.g. ['path', 'to', 'qiskit', 'quantum_info', 'states', 'statevector']
         loc = path_elems.index('qiskit')
@@ -373,11 +432,23 @@ class SignatureImprover:
         self.global_class2modules = class2modules
         self.detect_missing_symbols = detect_missing_symbols
         self.verbose = verbose
-        self._classname2info: Dict[str, ClassInfo] = {}
+        self._classname2info: Dict[str, ClassInfo] = {}  # key: class name, value: class info
 
     @property
     def class_names(self):
         return self._classname2info.keys()
+
+    @property
+    def missing_symbols(self) -> Dict[str, List[str]]:
+        symbols = {}
+        for info in self._classname2info.values():
+            for from_, modules in info.missing_symbols.items():
+                symbols.setdefault(from_, set())
+                symbols[from_] |= set(modules)
+        for from_, modules in symbols.items():
+            symbols[from_] = sorted(modules)
+
+        return symbols
 
     def methods2signatures(self, class_name: str):
         if class_name in self._classname2info:
@@ -400,7 +471,16 @@ class SignatureImprover:
             obj_name, obj_type = x
             # proc for each class in the module
             if inspect.isclass(obj_type):
-                info = ClassInfo(self.module_name, obj_name, obj_type, self.visitor, self.global_class2modules, local_class2modules, self.detect_missing_symbols, self.verbose)
+                info = ClassInfo(
+                    self.module_name,
+                    obj_name,
+                    obj_type,
+                    self.visitor,
+                    self.global_class2modules,
+                    local_class2modules,
+                    self.detect_missing_symbols,
+                    self.verbose,
+                )
                 self._classname2info[obj_name] = info
 
 
@@ -437,9 +517,11 @@ class SignatureReplacer:
             class_name = None
             method_name = None
             new_method_decl = None
-            for line in fin.readlines():
-                line = line.rstrip()
 
+            lines = [line.rstrip() for line in fin.readlines()]
+            last_import_line_no_line_no = self._calc_last_import_line_no(lines)
+
+            for line_no, line in enumerate(lines):
                 # end of class definition
                 if class_name is not None and re.search(r'^\S', line):
                     class_name = None
@@ -452,12 +534,21 @@ class SignatureReplacer:
                     method_name = None
                     continue
 
-                if m := re.search(r'^class\s+(\S+)\s*\(', line):
+                # start of class definition
+                if m := re.search(r'^class\s+(\S+?)\s*[:\(]', line):
                     class_name = m.group(1)
                     print(line, file=fout)
                     continue
 
-                if class_name is not None:
+                if class_name is None:
+                    print(line, file=fout)
+
+                    if line_no == last_import_line_no_line_no:
+                        # dump missing import
+                        for from_, modules in self.signature_improver.missing_symbols.items():
+                            print(f"from {from_} import {', '.join(modules)}", file=fout)
+                else:
+                    # start of method signature
                     if m := re.search(r'^\s+def\s+(\S+)\s*\(', line):
                         method_name = m.group(1)
                         if method_name in self.signature_improver.methods2signatures(class_name):
@@ -476,8 +567,6 @@ class SignatureReplacer:
                     else:
                         if method_name is None:
                             print(line, file=fout)
-                else:
-                    print(line, file=fout)
 
         if fout != sys.stdout:
             fout.close()
@@ -487,10 +576,35 @@ class SignatureReplacer:
 
             shutil.move(out_file_path, self.file_path)
 
+    def _calc_last_import_line_no(self, lines: List[str]) -> int | None:
+        for line_no in range(len(lines) - 1, -1, -1):
+            line = lines[line_no]
+            if m := re.search(r'^import', line):
+                return line_no
+            elif m := re.search(r'^from', line):
+                if '(' not in line:
+                    return line_no
+                for lno in range(line_no, len(lines) - 1):
+                    if ')' in lines[lno]:
+                        return lno
+                # something odd...
+                return None
+
+        return None
+
 
 def autohints(
-    module_name: str, qiskit_root: str, suffix: str | None = None, inplace: bool = False, only_filename: List[str] | None = None, detect_missing_symbols: bool = False, verbose: bool = False
+    module_name: str,
+    qiskit_root: str,
+    suffix: str | None = None,
+    inplace: bool = False,
+    only_filename: List[str] | None = None,
+    detect_missing_symbols: bool = False,
+    verbose: bool = False,
 ):
+    if os.path.isfile(MISSING_SYMBOLS_FILE):
+        os.remove(MISSING_SYMBOLS_FILE)
+
     module_root = None
     for file_path in glob.glob(os.path.join(qiskit_root, '**/'), recursive=True):
         if os.path.isdir(file_path):
@@ -516,7 +630,8 @@ def autohints(
         if only_filename and os.path.basename(file_path) not in only_filename:
             continue
 
-        try:
+        #try:
+        if True:
             with open(file_path) as fin:
                 module = ast.parse(fin.read())
 
@@ -541,8 +656,8 @@ def autohints(
 
             signature_replacer = SignatureReplacer(file_path, signature_improver, suffix=suffix, inplace=inplace)
             signature_replacer.run()
-        except Exception as e:
-            print('[[Exception]]', file_path, e, file=sys.stderr)
+        #except Exception as e:
+        #    print('[[Exception]]', file_path, e, file=sys.stderr)
 
 
 def parse_opt():
