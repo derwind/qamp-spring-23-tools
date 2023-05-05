@@ -25,7 +25,38 @@ class ModuleInfo(TypedDict):
     module_names: List[str]
 
 
-def make_class2modules(module_root: str, suffix: str = None) -> Dict[str, ModuleInfo]:
+TYPING_SPECIAL_TREATMENTS: Dict[str, ModuleInfo] = {
+    'Tuple': {'definition': 'typing', 'module_names': []},
+    'Union': {'definition': 'typing', 'module_names': []},
+    'Optional': {'definition': 'typing', 'module_names': []},
+    'Callable': {'definition': 'typing', 'module_names': []},
+    'Literal': {'definition': 'typing', 'module_names': []},
+    'Dict': {'definition': 'typing', 'module_names': []},
+    'List': {'definition': 'typing', 'module_names': []},
+    'Set': {'definition': 'typing', 'module_names': []},
+    'FrozenSet': {'definition': 'typing', 'module_names': []},
+    'Sequence': {'definition': 'typing', 'module_names': []},
+    'Mapping': {'definition': 'typing', 'module_names': []},
+    'Iterable': {'definition': 'typing', 'module_names': []},
+}
+
+SPECIAL_TREATMENTS: Dict[str, ModuleInfo] = {
+    'Layout': {'definition': 'qiskit.transpiler.layout', 'module_names': []},
+}
+SPECIAL_TREATMENTS.update(TYPING_SPECIAL_TREATMENTS)
+
+KNOWN_CIRCULAR_IMPORT: Dict[str, ModuleInfo] = {
+    'Pauli': {'PauliList', 'Clifford'},
+    'Operator': {'Layout'},
+    'SuperOp': {'Statevector', 'DensityMatrix'},
+}
+
+# API docstrings may be dynamically generated, e.g., quantum_info/operators/mixins/*.py, also see __init__.py
+IGNORED_MODULES = {'qiskit.quantum_info.operators.mixins'}
+IGNORED_FILES = {'quantum_channel.py'}
+
+
+def make_class2modules(module_root: str, suffix: str = None, enable_special_treatment: bool = False) -> Dict[str, ModuleInfo]:
     def name_dist(a: str, b: str):
         if a in b:
             return -b.replace(a, '').count('.')
@@ -57,6 +88,10 @@ def make_class2modules(module_root: str, suffix: str = None) -> Dict[str, Module
 
     for cls, modules in sorted(class2modules.items()):
         modules['module_names'] = sorted(modules['module_names'], key=cmp_to_key(name_dist))
+
+    if enable_special_treatment:
+        # These info are hard to be automatically collected.
+        class2modules.update(SPECIAL_TREATMENTS)
 
     return class2modules
 
@@ -92,6 +127,45 @@ class ImportVisitor(ast.NodeVisitor):
             self._name2info[alias.name] = AstClassInfo(module, alias.name)
 
 
+class ClassVisitor(ast.NodeVisitor):
+    def __init__(self):
+        super().__init__()
+        self._class2methods: Dict[str, Dict[str, str]] = {}
+
+    @property
+    def class2methods(self):
+        return self._class2methods
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        class MethodVisitor(ast.NodeVisitor):
+            def __init__(self):
+                super().__init__()
+                self._method2signature = {}
+
+            @property
+            def method2signature(self):
+                return self._method2signature
+
+            def visit_FunctionDef(self, node):
+                signature_elems = []
+                if node.args.args:
+                    signature_elems.extend([x.arg for x in node.args.args])
+                if node.args.vararg is not None:
+                    signature_elems.append('*' + node.args.vararg.arg)
+                if node.args.kwonlyargs:
+                    if node.args.vararg is None:
+                        signature_elems.append('*')
+                    signature_elems.extend([x.arg for x in node.args.kwonlyargs])
+                if node.args.kwarg is not None:
+                    signature_elems.append('**' + node.args.kwarg.arg)
+
+                self.method2signature[node.name] = f"({', '.join(signature_elems)})"
+
+        visitor = MethodVisitor()
+        visitor.visit(node)
+        self._class2methods[node.name] = visitor.method2signature
+
+
 class ClassInfo:
     """inspect given class and manage info of class such as signatures of methods belonging to it"""
 
@@ -104,15 +178,20 @@ class ClassInfo:
         global_class2modules: Dict[str, ModuleInfo],
         local_class2modules: Dict[str, ModuleInfo],
         detect_missing_symbols: bool = False,
+        enhance_missing_symbols_treatment: bool = False,
+        ast_method2signature: Dict[str, str] | None = None,
         verbose: bool = False,
     ) -> Dict[str, str]:
         self.visitor = visitor
         self.global_class2modules = global_class2modules
         self.local_class2modules = local_class2modules
         self.detect_missing_symbols = detect_missing_symbols
+        self.enhance_missing_symbols_treatment = enhance_missing_symbols_treatment
+        self.ast_method2signature: Dict[str, str] = ast_method2signature or {}
         self.verbose = verbose
         self._methods2signatures = {}
         self._missing_symbols = {}
+        self._missing_symbols_bringing_circular_import = {}
         full_class_name = self.extract_class_name(str(class_type))
         if self.isclass_in_file(full_class_name, module_name):
             # sig = inspect.signature(class_type)
@@ -139,6 +218,10 @@ class ClassInfo:
     def missing_symbols(self) -> Dict[str, List[str]]:
         return self._missing_symbols
 
+    @property
+    def missing_symbols_bringing_circular_import(self) -> Dict[str, List[str]]:
+        return self._missing_symbols_bringing_circular_import
+
     def _method_proc(self, short_class_name: str, short_method_name: str, insp_method, is_classmethod: bool) -> Tuple[str, str] | Tuple[None, None]:
         if inspect.isfunction(insp_method):
             full_method_name = str(insp_method).split(' ')[1]
@@ -153,6 +236,8 @@ class ClassInfo:
         signature = inspect.signature(insp_method)
         if self.verbose:
             print('[Type Hint]', full_method_name, '=>', signature.parameters, '->', signature.return_annotation)
+            if short_method_name in self.ast_method2signature:
+                print('[AST info ]', full_method_name, '=>', self.ast_method2signature[short_method_name])
 
         # print('[DOCSTRING]', inspect.getdoc(method_type))
         try:
@@ -191,6 +276,11 @@ class ClassInfo:
                         # from_module = second_candidate if second_candidate else definition
 
                         # memory info for later use
+                        if self.enhance_missing_symbols_treatment:
+                            if short_class_name in KNOWN_CIRCULAR_IMPORT and symbol in KNOWN_CIRCULAR_IMPORT[short_class_name]:
+                                self._missing_symbols_bringing_circular_import.setdefault(definition, [])
+                                self._missing_symbols_bringing_circular_import[definition].append(symbol)
+                                continue
                         self._missing_symbols.setdefault(definition, [])
                         self._missing_symbols[definition].append(symbol)
 
@@ -231,10 +321,12 @@ class ClassInfo:
                     hint_parts.append('str')
                 elif h == 'boolean':
                     hint_parts.append('bool')
-                elif h == 'array' or h == 'np.array':
+                elif h == 'array' or h == 'ndarray' or h == 'np.array' or h == 'Numpy.ndarray':
                     hint_parts.append('np.ndarray')
                 elif h == 'Circuit':
                     hint_parts.append('QuantumCircuit')
+                elif h == 'matrix':
+                    hint_parts.append('np.matrix')
                 elif h == 'matrix_like':
                     # just ignore
                     pass
@@ -272,7 +364,7 @@ class ClassInfo:
                                 else:
                                     h = info.alias
                     hint_parts.append(h)
-            return ' | '.join(hint_parts)
+            return ' | '.join(hint_parts) if hint_parts else None
 
         @dataclass
         class DummyDetail:
@@ -286,12 +378,39 @@ class ClassInfo:
         def supplement_signature_parameters(signature) -> dict:
             """signature may have '*', so take care of such cases, e.g., z2_symmetries.py"""
 
+            def split_signature_str2list(signature_str):
+                # return re.split(r'\s*,\s*', signature_str)
+
+                signature_list = []
+                depth = 0
+                start = 0
+                seek_start = False
+                for i, c in enumerate(signature_str):
+                    if seek_start:
+                        if c != ' ':
+                            start = i
+                            seek_start = False
+                        continue
+
+                    if c == ',' and depth == 0:
+                        signature_list.append(signature_str[start:i])
+                        seek_start = True
+                    elif c == '[':
+                        depth += 1
+                    elif c == ']':
+                        depth -= 1
+                if not seek_start:
+                    signature_list.append(signature_str[start:])
+
+                return signature_list
+
             signature_parameters = OrderedDict()
 
             signature_str = str(signature)
             signature_str = re.split(r'\s*->\s*', signature_str)[0]
             signature_str = signature_str.replace('(', '').replace(')', '')
-            signature_list = re.split(r'\s*,\s*', signature_str)
+            # difficult case: assign_parameters(self, parameters: Mapping[Parameter, complex | ParameterExpression]| Sequence[complex | ParameterExpression], inplace: bool = False) of sparse_pauli_op.py
+            signature_list = split_signature_str2list(signature_str)
             signature_list = [re.split(r'\s*=\s*', parameter)[0] for parameter in signature_list]
             signature_list = [re.split(r'\s*:\s*', parameter)[0] for parameter in signature_list]
             for key in signature_list:
@@ -333,8 +452,13 @@ class ClassInfo:
                     if 'Optional' not in name2hint[qualified_name] and 'None' not in name2hint[qualified_name]:
                         name2hint[qualified_name] += ' | None'
                 default_value = detail.default
+                # e.g. "string"
                 if isinstance(detail.default, str):
                     default_value = f'"{default_value}"'
+                # e.g. dtype=complex in sparse_pauli_op.py
+                elif isinstance(detail.default, type):
+                    if m := re.match(r"<class '(\S+)'>", str(default_value)):
+                        default_value = m.group(1)
                 name2default[qualified_name] = default_value
 
         new_signature_elems = []
@@ -354,23 +478,35 @@ class ClassInfo:
         # returns of methods
         if signature.return_annotation != inspect.Parameter.empty:  # from type hint
             return_type = fix_hint(self.extract_class_name(str(signature.return_annotation)))
-            new_signature += f' -> {return_type}'
+            if return_type is not None:
+                new_signature += f' -> {return_type}'
         else:
             if doc_returns_types:  # from docstring
                 if isinstance(doc_returns_types, docstring_parser.common.DocstringReturns):
                     if doc_returns_types.type_name not in self.ignore_cases:
-                        new_signature += f' -> {fix_hint(doc_returns_types.type_name)}'
+                        return_type = fix_hint(doc_returns_types.type_name)
+                        if return_type is not None:
+                            new_signature += f' -> {return_type}'
                 elif inspect.isclass(doc_returns_types):
                     full_class_name = self.extract_class_name(str(doc_returns_types))
-                    new_signature += f' -> {fix_hint(full_class_name)}'
+                    return_type = fix_hint(full_class_name)
+                    if return_type is not None:
+                        new_signature += f' -> {return_type}'
                 else:
                     return_type = fix_hint(str(doc_returns_types))
-                    new_signature += f' -> {return_type}'
+                    if return_type is not None:
+                        new_signature += f' -> {return_type}'
 
         return new_signature
 
     def _detect_missing_symbols(self, arg_types: List[str], returns_types: str | None = None) -> Set[str]:
         """detect symbols which are globally known but are not locally known"""
+
+        def check_typing(typ, missing_candidates):
+            for typing_type in TYPING_SPECIAL_TREATMENTS:
+                # missing 'from typing import xxx'
+                if typing_type + '[' in typ and typing_type not in self.visitor.name2info:
+                    missing_candidates.add(typing_type)
 
         types = set()
         for typ in arg_types:
@@ -384,6 +520,7 @@ class ClassInfo:
             # candidates are what are not found locally, but found globally
             if typ not in self.local_class2modules and typ in self.global_class2modules:
                 missing_candidates.add(typ)
+            check_typing(typ, missing_candidates)
 
         if self.verbose:
             if missing_candidates:
@@ -453,8 +590,12 @@ class SignatureImprover:
         visitor: ImportVisitor,
         class2modules: Dict[str, ModuleInfo],
         detect_missing_symbols: bool = False,
+        enhance_missing_symbols_treatment: bool = False,
         verbose: bool = False,
     ):
+        # with open(file_path) as fin:
+        #    module = ast.parse(fin.read())
+
         file_path, _ = os.path.splitext(file_path)  # e.g. path/to/qiskit/quantum_info/states/statevector
         path_elems = file_path.split(os.sep)  # e.g. ['path', 'to', 'qiskit', 'quantum_info', 'states', 'statevector']
         loc = path_elems.index('qiskit')
@@ -463,8 +604,13 @@ class SignatureImprover:
         self.visitor = visitor
         self.global_class2modules = class2modules
         self.detect_missing_symbols = detect_missing_symbols
+        self.enhance_missing_symbols_treatment = enhance_missing_symbols_treatment
         self.verbose = verbose
         self._classname2info: Dict[str, ClassInfo] = {}  # key: class name, value: class info
+
+        # class_visitor = ClassVisitor()
+        # class_visitor.visit(module)
+        self.ast_class2methods = {}  # class_visitor.class2methods
 
     @property
     def class_names(self):
@@ -472,9 +618,23 @@ class SignatureImprover:
 
     @property
     def missing_symbols(self) -> Dict[str, List[str]]:
+        """return file global missing symbols"""
         symbols = {}
         for info in self._classname2info.values():
             for from_, modules in info.missing_symbols.items():
+                symbols.setdefault(from_, set())
+                symbols[from_] |= set(modules)
+        for from_, modules in symbols.items():
+            symbols[from_] = sorted(modules)
+
+        return symbols
+
+    @property
+    def missing_symbols_bring_circular_import(self) -> Dict[str, List[str]]:
+        """return file global missing symbols which bring circular import"""
+        symbols = {}
+        for info in self._classname2info.values():
+            for from_, modules in info.missing_symbols_bringing_circular_import.items():
                 symbols.setdefault(from_, set())
                 symbols[from_] |= set(modules)
         for from_, modules in symbols.items():
@@ -501,6 +661,7 @@ class SignatureImprover:
             if not isinstance(x, tuple):
                 continue
             obj_name, obj_type = x
+            ast_method2signature = self.ast_class2methods[obj_name] if obj_name in self.ast_class2methods else {}
             # proc for each class in the module
             if inspect.isclass(obj_type):
                 info = ClassInfo(
@@ -511,6 +672,8 @@ class SignatureImprover:
                     self.global_class2modules,
                     local_class2modules,
                     self.detect_missing_symbols,
+                    self.enhance_missing_symbols_treatment,
+                    ast_method2signature,
                     self.verbose,
                 )
                 self._classname2info[obj_name] = info
@@ -585,9 +748,14 @@ class SignatureReplacer:
                         # dump missing import
                         for from_, modules in self.signature_improver.missing_symbols.items():
                             print(f"from {from_} import {', '.join(modules)}  # added by auto_typehints", file=fout)
+                        if self.signature_improver.missing_symbols_bring_circular_import:
+                            print('from typing import TYPE_CHECKING', file=fout)
+                            print('if TYPE_CHECKING:', file=fout)
+                            for from_, modules in self.signature_improver.missing_symbols_bring_circular_import.items():
+                                print(f"    from {from_} import {', '.join(modules)}  # added by auto_typehints", file=fout)
                 else:
                     # start of method signature
-                    if m := re.search(r'^\s+def\s+(\S+)\s*\(', line):
+                    if m := re.search(r'^    def\s+(\S+)\s*\(', line):
                         method_name = m.group(1)
                         if method_name in self.signature_improver.methods2signatures(class_name):
                             signature = self.signature_improver.methods2signatures(class_name)[method_name]
@@ -642,11 +810,12 @@ class SignatureReplacer:
 
 
 def retrieve_directory_path(module_name: str, qiskit_root: str) -> str:
+    dir_name = module_name.replace('.', os.sep)
     for file_path in glob.glob(os.path.join(qiskit_root, '**/'), recursive=True):
         if os.path.isdir(file_path):
             if file_path[-1] == os.sep:
                 file_path = file_path[:-1]
-            if file_path.split(os.sep)[-1] == module_name:
+            if file_path.endswith(dir_name):
                 return file_path
 
     return None
@@ -667,6 +836,7 @@ def autohints(
     only_filename: List[str] | None = None,
     only_dirname: List[str] | None = None,
     detect_missing_symbols: bool = False,
+    enhance_missing_symbols_treatment: bool = False,
     verbose: bool = False,
 ):
     if os.path.isfile(MISSING_SYMBOLS_FILE):
@@ -684,11 +854,18 @@ def autohints(
             raise ModuleNotFoundError(f"'{dname}' is not found")
         retrieved_only_dirname.append(path)
 
+    retrieved_ignored_dirname = []
+    for dname in IGNORED_MODULES:
+        path = retrieve_directory_path(dname, qiskit_root)
+        if path is None:
+            raise ModuleNotFoundError(f"'{dname}' is not found")
+        retrieved_ignored_dirname.append(path)
+
     sys.path.append(qiskit_root)
     sys.path.append(module_root)
 
     # First, collect 'class to module' info
-    class2modules = make_class2modules(module_root, suffix)
+    class2modules = make_class2modules(module_root, suffix, enhance_missing_symbols_treatment)
 
     # Second, improve signature
     for file_path in glob.glob(os.path.join(module_root, '**/*.py'), recursive=True):
@@ -697,6 +874,10 @@ def autohints(
         if only_filename and os.path.basename(file_path) not in only_filename:
             continue
         if retrieved_only_dirname and not path_contains_any(os.path.dirname(file_path), retrieved_only_dirname):
+            continue
+        if retrieved_ignored_dirname and path_contains_any(os.path.dirname(file_path), retrieved_ignored_dirname):
+            continue
+        if os.path.basename(file_path) in IGNORED_FILES:
             continue
 
         # try:
@@ -713,7 +894,9 @@ def autohints(
                 print(visitor.name2info)
                 print('#--------------------------')
 
-            signature_improver = SignatureImprover(file_path, visitor, class2modules, detect_missing_symbols, verbose=verbose)
+            signature_improver = SignatureImprover(
+                file_path, visitor, class2modules, detect_missing_symbols, enhance_missing_symbols_treatment, verbose=verbose
+            )
             signature_improver.run()
 
             if verbose:
@@ -739,6 +922,12 @@ def parse_opt():
     group.add_argument('--only', dest='only_filename', nargs='*', type=str, default=[], help='file name')
     group.add_argument('--only-dir', dest='only_dirname', nargs='*', type=str, default=[], help='directory name')
     parser.add_argument('--detect-missing-symbols', dest='detect_missing_symbols', action='store_true', help='detect missing symbols?')
+    parser.add_argument(
+        '--enhance-missing-symbols-treatment',
+        dest='enhance_missing_symbols_treatment',
+        action='store_true',
+        help='enhance missing symbols treatment? (to the extent possible)',
+    )
     parser.add_argument('--verbose', action='store_true', help='output logs?')
     parser.add_argument('module_name', type=str, help="module_name such as 'quantum_info'")
 
@@ -757,6 +946,7 @@ def main():
         args.only_filename,
         args.only_dirname,
         args.detect_missing_symbols,
+        args.enhance_missing_symbols_treatment,
         args.verbose,
     )
 
