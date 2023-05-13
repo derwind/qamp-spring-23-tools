@@ -316,7 +316,7 @@ class ClassInfo:
             for h in re.split(r'\s*\|\s*', hint):
                 if h == class_name:
                     # e.g. Statevector -> "Statevector"
-                    hint_parts.append(f'"{h}"')
+                    hint_parts.append(f'{h}')
                 elif h == 'string':
                     hint_parts.append('str')
                 elif h == 'boolean':
@@ -739,7 +739,7 @@ class SignatureReplacer:
                 if class_name is None:
                     if line_no == first_import_line_no:
                         if '__future__' not in line:
-                            print('from __future__ import annotations  # added by auto_typehints', file=fout)
+                            print('from __future__ import annotations', file=fout)
 
                     print(line, file=fout)
 
@@ -747,12 +747,12 @@ class SignatureReplacer:
                     if line_no == last_import_line_no:
                         # dump missing import
                         for from_, modules in self.signature_improver.missing_symbols.items():
-                            print(f"from {from_} import {', '.join(modules)}  # added by auto_typehints", file=fout)
+                            print(f"from {from_} import {', '.join(modules)}", file=fout)
                         if self.signature_improver.missing_symbols_bring_circular_import:
                             print('from typing import TYPE_CHECKING', file=fout)
                             print('if TYPE_CHECKING:', file=fout)
                             for from_, modules in self.signature_improver.missing_symbols_bring_circular_import.items():
-                                print(f"    from {from_} import {', '.join(modules)}  # added by auto_typehints", file=fout)
+                                print(f"    from {from_} import {', '.join(modules)}", file=fout)
                 else:
                     # start of method signature
                     if m := re.search(r'^    def\s+(\S+)\s*\(', line):
